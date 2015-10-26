@@ -7,8 +7,8 @@
 
 namespace Drupal\fallback_formatter\Plugin\Field\FieldFormatter;
 
-use Drupal\Component\Utility\SafeMarkup;
-use Drupal\Component\Utility\Xss;
+use Drupal\Component\Render\FormattableMarkup;
+use Drupal\Component\Utility\Html;
 use Drupal\Core\Field\FieldDefinitionInterface;
 use Drupal\Core\Field\FieldItemListInterface;
 use Drupal\Core\Field\FormatterBase;
@@ -47,6 +47,12 @@ class FallbackFormatter extends FormatterBase {
     $items_array = array();
     foreach ($items as $item) {
       $items_array[] = $item;
+    }
+
+    foreach ($settings['formatters'] as $key => $formatter) {
+      if (!$formatter['status']) {
+        unset($settings['formatters'][$key]);
+      }
     }
 
     // Merge defaults from the formatters and ensure proper ordering.
@@ -93,70 +99,72 @@ class FallbackFormatter extends FormatterBase {
     $formatters = $settings['formatters'];
     $this->prepareFormatters($this->fieldDefinition->getType(), $formatters, FALSE);
 
-    $elements['#attached']['library'][] = 'fallback_formatter/admin';
-
-    $parents = array('fields', $this->fieldDefinition->getName(), 'settings_edit_form', 'settings', 'formatters');
-
-    // Filter status.
-    $elements['formatters']['status'] = array(
-      '#type' => 'item',
-      '#title' => t('Enabled formatters'),
-      '#prefix' => '<div class="fallback-formatter-status-wrapper">',
-      '#suffix' => '</div>',
-    );
+    $rows = [];
     foreach ($formatters as $name => $options) {
-      $elements['formatters']['status'][$name] = array(
-        '#type' => 'checkbox',
-        '#title' => $options['label'],
-        '#default_value' => !empty($options['status']),
-        '#parents' => array_merge($parents, array($name, 'status')),
-        '#weight' => $options['weight'],
-      );
-    }
-
-    // Filter order (tabledrag).
-    $elements['formatters']['order'] = array(
-      '#type' => 'item',
-      '#title' => t('Formatter processing order'),
-      '#theme' => 'fallback_formatter_settings_order',
-    );
-    foreach ($formatters as $name => $options) {
-      $elements['formatters']['order'][$name]['label'] = array(
+      $rows[$name] = [];
+      $rows[$name]['#attributes']['class'][] = 'draggable';
+      $rows[$name]['#weight'] = $options['weight'];
+      $rows[$name]['label'] = array(
         '#markup' => $options['label'],
       );
-      $elements['formatters']['order'][$name]['weight'] = array(
+      $rows[$name]['weight'] = array(
         '#type' => 'weight',
         '#title' => t('Weight for @title', array('@title' => $options['label'])),
         '#title_display' => 'invisible',
         '#delta' => 50,
         '#default_value' => $options['weight'],
-        '#parents' => array_merge($parents, array($name, 'weight')),
+        '#attributes' => ['class' => ['fallback-formatter-order-weight']],
       );
-      $elements['formatters']['order'][$name]['#weight'] = $options['weight'];
-    }
+      $rows[$name]['status'] = array(
+        '#type' => 'select',
+        '#title_display' => 'invisible',
+        '#options' => array_combine(array_keys($this->getRegions()), array_column($this->getRegions(), 'title')),
+        '#default_value' => (int) $options['status'],
+      );
 
-    // Filter settings.
-    foreach ($formatters as $name => $options) {
+      // Filter settings.
       $formatter_instance = $this->getFormatter($options);
       $settings_form = $formatter_instance->settingsForm($form, $form_state);
 
       if (!empty($settings_form)) {
-        $elements['formatters']['settings'][$name] = array(
+        $rows[$name]['settings'][] = array(
           '#type' => 'fieldset',
           '#title' => $options['label'],
-          '#parents' => array_merge($parents, array($name, 'settings')),
           '#weight' => $options['weight'],
           '#group' => 'formatter_settings',
+          '#states' => [
+            'visible' => [
+              ':input[name="fields[' . $form_state->getTriggeringElement()['#field_name'] . '][settings_edit_form][settings][formatters][' . $name . '][status]"]' => array('value' => '1'),
+            ],
+          ],
         );
-        $elements['formatters']['settings'][$name] += $settings_form;
+        $rows[$name]['settings'][$name] = $settings_form;
       }
-
-      $elements['formatters']['settings'][$name]['formatter'] = array(
-        '#type' => 'value',
-        '#value' => $name,
-        '#parents' => array_merge($parents, array($name, 'formatter')),
-      );
     }
+
+    $header = [
+      'label' => $this->t('Label'),
+      'weight' => $this->t('Weight'),
+      'status' => $this->t('Status'),
+    'settings' => '',
+    ];
+
+    $elements['formatters'] = [
+      '#type' => 'table',
+      '#title' => t('Formatter processing order'),
+      '#regions' => $this->getRegions(),
+      '#header' => $header,
+      '#tree' => TRUE,
+      '#empty' => $this->t('There are no fields available.'),
+      '#tabledrag' => array(
+        array(
+          'action' => 'order',
+          'relationship' => 'sibling',
+          'group' => 'fallback-formatter-order-weight',
+        ),
+      ),
+      '#theme_wrappers' => array('form_element'),
+    ] + $rows;
 
     return $elements;
   }
@@ -172,21 +180,23 @@ class FallbackFormatter extends FormatterBase {
 
     $summary_items = array();
     foreach ($settings['formatters'] as $name => $options) {
-      if (!isset($formatters[$name])) {
-        $summary_items[] = t('Unknown formatter %name.', array('%name' => $name));
-      }
-      elseif (!in_array($this->fieldDefinition->getType(), $formatters[$name]['field_types'])) {
-        $summary_items[] = t('Invalid formatter %name.', array('%name' => $formatters[$name]['label']));
-      }
-      else {
+      if ($options['status']) {
+        if (!isset($formatters[$name])) {
+          $summary_items[] = t('Unknown formatter %name.', array('%name' => $name));
+        }
+        elseif (!in_array($this->fieldDefinition->getType(), $formatters[$name]['field_types'])) {
+          $summary_items[] = t('Invalid formatter %name.', array('%name' => $formatters[$name]['label']));
+        }
+        else {
 
-        $formatter_instance = $this->getFormatter($options);
-        $result = $formatter_instance->settingsSummary();
+          $formatter_instance = $this->getFormatter($options);
+          $result = $formatter_instance->settingsSummary();
 
-        $summary_items[] = SafeMarkup::format('<strong>@label</strong>!settings_summary', array(
-          '@label' => $formatter_instance->getPluginDefinition()['label'],
-          '!settings_summary' => '<br>' . Xss::filter(!empty($result) ? implode(', ', $result) : ''),
-        ));
+          $summary_items[] = new FormattableMarkup('<strong>@label</strong><br>@settings_summary', array(
+            '@label' => $formatter_instance->getPluginDefinition()['label'],
+            '@settings_summary' => !empty($result) ? implode(', ', $result) : '',
+          ));
+        }
       }
     }
 
@@ -201,7 +211,7 @@ class FallbackFormatter extends FormatterBase {
       $summary = array(
         '#theme' => 'item_list',
         '#items' => $summary_items,
-        '#type' => 'ol'
+        '#type' => 'ol',
       );
     }
 
@@ -261,11 +271,7 @@ class FallbackFormatter extends FormatterBase {
     $formatters = array_intersect_key($formatters, $allowed_formatters);
 
     foreach ($formatters as $formatter => $info) {
-      // Remove disabled formatters.
-      if ($filter_enabled && empty($info['status'])) {
-        unset($formatters[$formatter]);
-        continue;
-      }
+      $formatters[$formatter] += array('status' => FALSE);
 
       // Provide some default values.
       $formatters[$formatter] += array('weight' => $default_weight++);
@@ -312,5 +318,21 @@ class FallbackFormatter extends FormatterBase {
     return $return;
   }
 
+  /**
+   * Get the regions needed to create the settings fallback_formatter form.
+   */
+  public function getRegions() {
+    return array(
+      TRUE => array(
+        'title' => $this->t('Enabled'),
+        'invisible' => TRUE,
+        'message' => $this->t('No field is enabled.'),
+      ),
+      FALSE => array(
+        'title' => $this->t('Disabled', array(), array('context' => 'Plural')),
+        'message' => $this->t('No field is disabled.'),
+      ),
+    );
+  }
 
 }
